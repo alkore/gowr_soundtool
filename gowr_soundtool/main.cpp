@@ -2,272 +2,213 @@
 #include <cstddef>
 #include <fstream>
 #include <string>
-#include <mutex>
+#include <vector>
 #include <filesystem>
 #include <span>
 #include <algorithm>
 #include <mutex>
 #include <format>
+#include <cstring>
 
 namespace fs = std::filesystem;
 
 struct TOC_Entry_t
 {
-	std::uint32_t m_file_id;
-	std::uint32_t m_file_size;
-	std::uint32_t m_offset;
+    std::uint32_t m_file_id;
+    std::uint32_t m_file_size;
+    std::uint32_t m_offset;
 };
 
 struct TOC_Header_t
 {
-	std::uint32_t m_magic; // 0x4b415041
-	std::uint32_t m_version;
-	std::uint32_t m_entries_count;
-	std::uint32_t m_parts_count; // always '1'
+    std::uint32_t m_magic;         // 0x4b415041
+    std::uint32_t m_version;
+    std::uint32_t m_entries_count;
+    std::uint32_t m_parts_count;   // always 1
 };
 
-
-// Mutexes
-static std::mutex files_sorted_mtx;
-static std::mutex files_entries_mtx;
-
-
-// Read the binary file into string
-[[nodiscard]] inline std::string BinToString( 
-	const fs::path & file_path
-)
+// Read binary file into string
+[[nodiscard]] std::string BinToString(const fs::path& file_path)
 {
-	std::ifstream file_in( file_path, std::ios::binary );
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file)
+        throw std::runtime_error(std::format("Failed to open file '{}'", file_path.string()));
 
-	if (!file_in)
-		throw std::runtime_error( std::format( "Failed to open file '{}'", file_path.string() ) );
+    file.seekg(0, std::ios::end);
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
 
-	file_in.seekg( 0, std::ios::end );
-	std::streamsize size = file_in.tellg();
-	file_in.seekg( 0, std::ios::beg );
+    if (size <= 0)
+        throw std::runtime_error(std::format("File '{}' is empty", file_path.string()));
 
-	if (size == 0)
-		throw std::runtime_error( std::format( "File '{}' is empty!", file_path.string() ) );
+    std::string buffer(static_cast<std::size_t>(size), '\0');
 
-	std::string buffer( static_cast<std::size_t>(size), '\0' );
+    if (!file.read(buffer.data(), size))
+        throw std::runtime_error(std::format("Failed to read file '{}'", file_path.string()));
 
-	if (!file_in.read( buffer.data(), size ))
-		throw std::runtime_error( std::format( "Failed to read file '{}'", file_path.string() ) );
-
-	return buffer;
+    return buffer;
 }
 
-
-// Write the specified file with content
-inline void WriteFile( 
-	const std::string file_name,
-	std::span<const char> data
-)
+// Write binary file
+void WriteFile(const fs::path& file_path, std::span<const char> data)
 {
-	std::ofstream file_out( file_name, std::ios_base::binary | std::ios::out );
+    std::ofstream file(file_path, std::ios::binary);
+    if (!file)
+        throw std::runtime_error(std::format("Failed to write file '{}'", file_path.string()));
 
-	if (!file_out)
-		throw std::runtime_error( std::format( "Failed to write the output file '{}'", file_name ) );
-
-	file_out.write( data.data(), static_cast<std::streamsize>(data.size()) );
-	file_out.close();
-
-	if (!file_out)
-		throw std::runtime_error( std::format( "Failed to write complete data to file '{}'", file_name ) );
+    file.write(data.data(), static_cast<std::streamsize>(data.size()));
+    if (!file)
+        throw std::runtime_error(std::format("Failed while writing file '{}'", file_path.string()));
 }
 
-
-// Unpack everything
-inline void UnpackAudio( 
-	const fs::path & toc_path
-)
+// Unpack .toc + .audiopack
+void UnpackAudio(const fs::path& toc_path)
 {
-	const fs::path out_dir = toc_path.parent_path() / toc_path.filename().stem();
-	fs::create_directories( out_dir );
+    fs::path out_dir = toc_path.parent_path() / toc_path.stem();
+    fs::create_directories(out_dir);
 
-	// Read TOC and audio pack data
-	const std::string toc_file = BinToString( toc_path );
+    const std::string toc_data = BinToString(toc_path);
 
-	const fs::path audiopack_path = toc_path.stem().stem() += fs::path {".0.audiopack"};
-	const std::string audio_pack_file = BinToString( audiopack_path );
+    fs::path audiopack_path = toc_path;
+    audiopack_path.replace_extension("");
+    audiopack_path += ".0.audiopack";
 
-	if (toc_file.size() < sizeof( TOC_Header_t ))
-		throw std::runtime_error( "TOC file is too small to contain a valid header." );
+    const std::string audiopack_data = BinToString(audiopack_path);
 
-	// Parse TOC header
-	const TOC_Header_t & toc_header = *reinterpret_cast<const TOC_Header_t *>(toc_file.data());
-	std::size_t entry_offset = sizeof( TOC_Header_t );
+    if (toc_data.size() < sizeof(TOC_Header_t))
+        throw std::runtime_error("Invalid TOC file");
 
-	// Check if the magic is valid
-	if(toc_header.m_magic != 0x4b415041)
-		throw std::runtime_error( "Invalid TOC file magic." );
+    const auto* header = reinterpret_cast<const TOC_Header_t*>(toc_data.data());
 
-	// Check if the number of entries is a valid one
-	if(toc_header.m_entries_count <= 0)
-		throw std::runtime_error( "Bad number of entries." );
+    if (header->m_magic != 0x4b415041)
+        throw std::runtime_error("Invalid TOC magic");
 
-	for (std::uint32_t i { 0 }; i < toc_header.m_entries_count; ++i)
-	{
-		if (entry_offset + sizeof( TOC_Entry_t ) > toc_file.size())
-			throw std::runtime_error( "TOC file is corrupted or incomplete." );
+    std::size_t offset = sizeof(TOC_Header_t);
 
-		// Parse each entry inside the TOC
-		const TOC_Entry_t & entry = *reinterpret_cast<const TOC_Entry_t *>(&toc_file[entry_offset]);
-		entry_offset += sizeof( TOC_Entry_t );
+    for (std::uint32_t i = 0; i < header->m_entries_count; ++i)
+    {
+        if (offset + sizeof(TOC_Entry_t) > toc_data.size())
+            throw std::runtime_error("Corrupted TOC");
 
-		// Check that the file offset and size are valid
-		if (entry.m_offset + entry.m_file_size > audio_pack_file.size())
-			throw std::runtime_error( "Audio pack file is corrupted or incomplete." );
+        const auto* entry =
+            reinterpret_cast<const TOC_Entry_t*>(toc_data.data() + offset);
+        offset += sizeof(TOC_Entry_t);
 
-		// Read the data and write it to a file
-		std::span<const char> file_data( &audio_pack_file[entry.m_offset], entry.m_file_size );
-		std::string file_name = std::format( "{}\\{}.wem", out_dir.string(), entry.m_file_id );
+        if (entry->m_offset + entry->m_file_size > audiopack_data.size())
+            throw std::runtime_error("Corrupted audiopack");
 
-		std::cout << std::format( "Writing '{}'\n", file_name );
+        std::span<const char> file_data(
+            audiopack_data.data() + entry->m_offset,
+            entry->m_file_size
+        );
 
-		WriteFile( file_name, file_data );
-	}
+        fs::path out_file = out_dir / std::format("{}.wem", entry->m_file_id);
+        std::cout << "Writing " << out_file << '\n';
 
-	std::cout << "\nSuccessfully unpacked all the files!" << std::endl;
+        WriteFile(out_file, file_data);
+    }
+
+    std::cout << "\nUnpack completed successfully\n";
 }
 
-
-// Pack all the .wem files back into .toc and .audiopack
-inline void PackAudio(
-	const fs::path & wem_directory
-)
+// Pack directory of .wem into .toc + .audiopack
+void PackAudio(const fs::path& wem_directory)
 {
-	static std::vector<TOC_Entry_t> entries;
-	std::uint32_t current_offset { 0 };
+    std::vector<fs::path> wem_files;
+    std::vector<TOC_Entry_t> entries;
 
-	const fs::path pack_file = wem_directory.stem() += fs::path { ".0.audiopack" };
-	std::ofstream pack_out( pack_file, std::ios::binary );
+    for (const auto& entry : fs::directory_iterator(wem_directory))
+    {
+        if (entry.is_regular_file() && entry.path().extension() == ".wem")
+            wem_files.push_back(entry.path());
+    }
 
-	if (!pack_out)
-		throw std::runtime_error( std::format( "Failed to open output pack file '{}'", pack_file.string() ) );
+    if (wem_files.empty())
+        throw std::runtime_error("No .wem files found");
 
-	static std::vector<fs::path> wem_files;
+    std::sort(wem_files.begin(), wem_files.end(),
+        [](const fs::path& a, const fs::path& b)
+        {
+            return std::stoi(a.stem().string()) < std::stoi(b.stem().string());
+        });
 
-	// Collect .wem files into a vector
-	for (const auto & entry : fs::directory_iterator( wem_directory ))
-	{
-		if ((entry.path().extension() == ".wem" && entry.is_regular_file()))
-		{
-			std::lock_guard guard( files_sorted_mtx );
-			wem_files.push_back( entry.path() );
-		}
-	}
+    fs::path audiopack_file = wem_directory;
+    audiopack_file.replace_extension("");
+    audiopack_file += ".0.audiopack";
 
-	// Comparator to sort files by the numeric part of the filename
-	auto sorted_files = []( 
-		const fs::path & lhs,
-		const fs::path & rhs ) -> bool
-	{
-		try
-		{
-			const std::uint32_t lhs_num = std::stoi( lhs.stem().string() );
-			const std::uint32_t rhs_num = std::stoi( rhs.stem().string() );
+    std::ofstream pack_out(audiopack_file, std::ios::binary);
+    if (!pack_out)
+        throw std::runtime_error("Failed to create audiopack");
 
-			return lhs_num < rhs_num;
-		}
-		catch (const std::exception & e)
-		{
-			std::cerr << "Error parsing filename:" << ' ' << e.what() << '\n';
-			return false;
-		}
-	};
+    std::uint32_t current_offset = 0;
 
-	// Sort files by the numeric part of the filename
-	std::sort( wem_files.begin(), wem_files.end(), sorted_files );
+    for (const auto& wem : wem_files)
+    {
+        std::string data = BinToString(wem);
 
-	std::cout << "Packing Audiopack file" << ' ' << pack_file << std::endl;
+        TOC_Entry_t entry;
+        entry.m_file_id = static_cast<std::uint32_t>(std::stoi(wem.stem().string()));
+        entry.m_file_size = static_cast<std::uint32_t>(data.size());
+        entry.m_offset = current_offset;
 
-	for (const auto & wem_file : wem_files)
-	{
-		const std::string file = BinToString( wem_file );
+        pack_out.write(data.data(), data.size());
+        current_offset += entry.m_file_size;
+        entries.push_back(entry);
+    }
 
-		std::uint32_t file_size = static_cast<std::uint32_t>(file.size());
-		std::uint32_t file_id = static_cast<std::uint32_t>(std::stoi( wem_file.stem().string() ));
+    pack_out.close();
 
-		pack_out.write( file.data(), file.size() );
+    fs::path toc_file = wem_directory;
+    toc_file.replace_extension("");
+    toc_file += ".audiopack.toc";
 
-		// Fill in an entry struct
-		TOC_Entry_t stream_entry { file_id, file_size, current_offset };
-		current_offset += file_size;
+    std::ofstream toc_out(toc_file, std::ios::binary);
+    if (!toc_out)
+        throw std::runtime_error("Failed to create TOC");
 
-		// Add to the list of entries
-		std::lock_guard guard( files_entries_mtx );
-		entries.push_back( stream_entry );
-	}
+    TOC_Header_t header{
+        0x4b415041,
+        1,
+        static_cast<std::uint32_t>(entries.size()),
+        1
+    };
 
-	pack_out.close();
+    toc_out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    for (const auto& e : entries)
+        toc_out.write(reinterpret_cast<const char*>(&e), sizeof(e));
 
-	if (entries.size() == 0)
-		throw std::runtime_error( "The directory does not contain any valid .wem file." );
-
-	// Now create the TOC file
-	TOC_Header_t toc_header { 0x4b415041, 1, static_cast<std::uint32_t>(entries.size()), 1 };
-
-	const fs::path toc_file = wem_directory.stem() += fs::path { ".audiopack.toc" };
-	std::ofstream toc_out( toc_file, std::ios::binary );
-
-	if (!toc_out)
-		throw std::runtime_error( std::format( "Failed to open output TOC file '{}'", toc_file.string() ) );
-
-	std::cout << "Packing TOC file" << ' ' << toc_file << std::endl;
-
-	// Write the TOC header
-	toc_out.write( reinterpret_cast<const char *>(&toc_header), sizeof( TOC_Header_t ) );
-
-	// Write the TOC entries
-	for (const auto & entry : entries)
-		toc_out.write( reinterpret_cast<const char *>(&entry), sizeof( TOC_Entry_t ) );
-
-	toc_out.close();
-
-	std::cout << "\nPacking completed successfully!" << std::endl;
+    std::cout << "\nPack completed successfully\n";
 }
 
-
-int main( 
-	int argc,
-	char * argv[]
-)
+int main(int argc, char* argv[])
 {
-	try
-	{
-		if (argc < 3)
-			throw std::invalid_argument( "Usage:\n\n gowr_soundtool --pack <dir_with_wem_files>\n\n or \n\ngowr_soundtool --unpack <toc_file_path>" );
+    try
+    {
+        if (argc < 3)
+            throw std::invalid_argument(
+                "Usage:\n"
+                "  gowr_soundtool --pack <wem_dir>\n"
+                "  gowr_soundtool --unpack <file.toc>"
+            );
 
-		if (std::strcmp( argv[1], "--unpack" ) == 0)
-		{
-			const fs::path toc_path = argv[2];
+        if (std::strcmp(argv[1], "--unpack") == 0)
+        {
+            UnpackAudio(argv[2]);
+        }
+        else if (std::strcmp(argv[1], "--pack") == 0)
+        {
+            PackAudio(argv[2]);
+        }
+        else
+        {
+            throw std::invalid_argument("Invalid argument");
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "[Error] " << e.what() << '\n';
+        return EXIT_FAILURE;
+    }
 
-			if (!fs::exists( toc_path ))
-				throw std::runtime_error( std::format( "TOC file {} does not exist !", toc_path.string() ) );
-
-			UnpackAudio( toc_path );
-		}
-
-		else if (std::strcmp( argv[1], "--pack" ) == 0)
-		{
-			const fs::path wem_directory = argv[2];
-
-			if (!fs::exists( wem_directory ) || !fs::is_directory( wem_directory ))
-				throw std::invalid_argument( "The specified directory does not exist or is not a directory." );
-
-			PackAudio( wem_directory );
-		}
-		else
-			throw std::invalid_argument( "You need to have either '--pack' or '--unpack' as the first argument." );
-	}
-	catch (const std::exception & e)
-	{
-		std::cerr << "[Error]" << ' ' << e.what() << std::endl;
-		static_cast<void>(std::getchar());
-
-		return EXIT_FAILURE;
-	}
-
-	return EXIT_SUCCESS;
+    return EXIT_SUCCESS;
 }
