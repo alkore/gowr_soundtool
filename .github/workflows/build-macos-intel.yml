@@ -9,6 +9,11 @@ jobs:
     runs-on: macos-12  # Intel runner
 
     steps:
+    - name: Check architecture
+      run: |
+        uname -m
+        sysctl -n machdep.cpu.brand_string
+    
     - name: Checkout
       uses: actions/checkout@v4
 
